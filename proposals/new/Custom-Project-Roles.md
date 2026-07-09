@@ -32,11 +32,11 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 **Core Changes:**
 
-1. **Database:** Move role permissions from hardcoded `rbac_role.go` to database (`role_permission` table)
+1. **Database:** Move role permissions from hardcoded `rbac_role.go` to the database (`role_permission` table) as the single source of truth
 2. **API:** Add role CRUD endpoints for system administrators
 3. **UI:** Add role management interface in System Administration section
 4. **Security:** Implement privilege escalation prevention and audit logging
-5. **Caching:** Load permissions at login (session-scoped cache)
+5. **Caching:** In-process (per-node) permission cache, on by default with a 1 s TTL; optional Redis tier off by default; all caching disableable (see *Performance Caching*)
 
 **Key Design Decisions:**
 
@@ -44,7 +44,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - **Minimal schema changes:** Only extend `role` table with metadata columns (`is_builtin`, `description`, `modified`, `created_by`, `modified_by`, timestamps)
 - **Discriminator pattern:** `role_permission.role_type` distinguishes 'project-role' (users/groups) from 'robotaccount' (direct permissions)
 - **System admin only:** Only system administrators can create/modify custom roles (project admins assign roles, existing workflow unchanged)
-- **Built-in role protection:** Built-in roles can be modified but not deleted; modifications are tracked and reversible
+- **Built-in roles are immutable:** The five built-in roles (projectAdmin, maintainer, developer, guest, limitedGuest) can be neither modified nor deleted — they are the stable, secure baseline. `is_builtin = TRUE` is enforced on both backend (create/update/delete reject built-in roles) and frontend (controls disabled). Only *custom* roles are editable.
+- **Single source of truth:** Role permissions (built-in and custom) live exclusively in `role_permission` + `permission_policy`; the compile-time `rolePoliciesMap` in `rbac_role.go` is removed. Built-in roles and any future built-in roles are seeded via **database migration** as part of the version-upgrade workflow — no Go code path re-introduces hardcoded permissions.
 
 **Technical Architecture:**
 
@@ -80,15 +81,15 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 │                                                              │
 │         ┌─────────────────┐                                  │
 │         │ users/groups    │                                  │
-│         └────────┬────────┘                                  │
-│                  │                                           │
+│         └─────────────────┘                                  │
 │                  ↑                                           │
-│         ┌─────────────────┐        ┌─────────────────┐       │
+│                  │                                           │
+│         ┌────────┴────────┐        ┌─────────────────┐       │
 │         │ project_member  │───────→│  role (table)   │       │
-│         └─────────────────┘        └────────┬────────┘       │
+│         └─────────────────┘        └─────────────────┘       │
 │                                             ↑                │
 │                                             │                │
-│                                    ┌─────────────────┐       │
+│                                    ┌────────┴────────┐       │
 │                                    │ role_permission │       │
 │                                    │ (role_type=     │       │
 │                                    │ 'project-role') │       │
@@ -107,8 +108,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 1. **System Admin:** Creates custom role "DevOps Engineer" with specific permissions
 2. **Project Admin:** Assigns "DevOps Engineer" role to user/group (same as built-in roles)
-3. **User Login:** Permissions loaded into session cache
-4. **Authorization:** Permission checks use cached permissions (O(1) lookup)
+3. **Authorization:** Permission checks resolve the member's role from the per-node cache (falling back to the DB on a miss); a role change propagates to all nodes within the cache TTL (1 s default)
 
 ## Non-Goals
 
@@ -118,25 +118,10 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 2. **Global role assignments:** Custom roles are assigned per-project (user can have different roles in different projects). Global role assignment is tracked in Issue #8351
 3. **Role templates/marketplace:** No predefined custom role templates in initial release
 4. **Role inheritance/composition:** Roles are flat, not hierarchical
-5. **Real-time permission updates:** Permission changes apply at next login (not mid-session)
+5. **Instant global propagation:** Role changes converge across all nodes within the cache TTL (1 s by default), not instantaneously; a zero-stale mode is available by disabling the cache (per-request DB evaluation)
 6. **Robot account roles:** Robots continue using direct permission assignment (no role concept)
 
 ## Rationale
-
-**Why extend existing RBAC vs. creating a new system:**
-
-✅ **Advantages:**
-- Leverages existing, battle-tested permission infrastructure
-- Minimal code changes (extend, don't replace)
-- No breaking changes to APIs or database schema
-- Consistent with Harbor's architectural patterns
-- Easy to understand for existing Harbor users and contributors
-
-❌ **Alternative: New parallel permission system:**
-- Would require maintaining two RBAC systems
-- Breaking changes to existing code
-- Higher risk of bugs and security issues
-- More complex for users to understand
 
 **Why database-driven vs. more built-in roles:**
 
@@ -166,18 +151,22 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - More complex audit trail
 - Can be added later if needed
 
-**Why session-scoped caching:**
+**Why a per-node in-memory cache (not session-scoped, not Redis-on-the-hot-path):**
 
-✅ **Advantages:**
-- Fast permission checks (O(1) in-memory lookup)
-- No database queries during requests
-- Simple cache invalidation (logout = clear)
-- Minimal performance impact
+The caching approach was chosen from a measured comparison (see *Performance Caching*), not
+assumed up front.
 
-❌ **Alternative: Real-time permission updates:**
-- Requires complex cache invalidation across sessions
-- Performance overhead for permission change propagation
-- Added complexity for minimal benefit (permissions rarely change mid-session)
+✅ **Chosen: L1 in-process cache (default), 1 s TTL, optional L2 Redis (off by default):**
+- Restores upstream-parity latency (the DB-per-request cost is +14–56 % on role-evaluating
+  endpoints — the measured problem)
+- Keeps authorization **in-process by default** — no Redis round-trip on the authz hot path,
+  avoiding the availability/latency failure mode seen in goharbor/harbor#23335
+- Bounded, tunable staleness: role changes converge across nodes within the L1 TTL (1 s)
+- Fully disableable (`ROLE_CACHE_L1_MEMORY_TTL=-1`) to fall back to per-request DB evaluation
+
+❌ **Rejected: session-scoped cache** — stale until logout; unacceptable revocation window.
+❌ **Rejected: Redis version-key checked per request** — reintroduces a per-request Redis
+dependency on authz (the exact hot-path risk of #23335).
 
 ## Compatibility
 
@@ -192,10 +181,17 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 ✅ **Migration strategy:**
 - Zero-downtime migration
-- Built-in role permissions migrated from `rbac_role.go` to `role_permission` table
-- Existing roles automatically marked `is_builtin=true`
+- Built-in role permissions migrated from `rbac_role.go` to `role_permission` table (e.g. `0190_2.16.0_schema.up.sql`)
+- Existing roles automatically marked `is_builtin=true` (inmutable)
 - All user/group assignments preserved
 - Rollback: Standard Harbor rollback procedure (custom roles become inaccessible but data preserved)
+
+**Future built-in roles.** Because the DB is the single source of truth, adding or changing a
+built-in role in a later release is a **migration-only** change: the new definition is inserted
+via that version's `up.sql` migration and marked `is_builtin=true`. No code path re-adds
+hardcoded permissions, so there is exactly one authoritative definition to review and audit.
+The hot lookup (`role_permission` by `role_type` + `role_id` → `permission_policy`) is index-backed
+to keep login/CLI-handshake query volume in check.
 
 **API Compatibility:**
 
@@ -209,11 +205,12 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - Project member assignment dropdown includes custom roles (alongside built-in roles)
 - No changes to existing workflows
 
-**Performance Impact:**
+**Performance Impact** (measured with `goharbor/perf`; see *Performance Caching* for method and full table):
 
-- **Login:** +50-100ms (one-time permission load)
-- **Requests:** No change (cached permissions)
-- **Database:** Minimal load increase (one query per login)
+- **Admins:** unaffected — a sysadmin skips the project-role evaluator, so there is no role lookup (feature is free regardless of cache).
+- **Project members, default (L1 cache on):** upstream parity on role-evaluating endpoints (overall −0.8 % vs upstream).
+- **Project members, cache off (per-request DB):** +14–56 % per endpoint (overall +15.4 %) — the cost the cache removes.
+- **Database:** one role_permission lookup per uncached evaluation; the 1 s L1 TTL collapses these to roughly one query per role per node per second.
 
 **Version Compatibility:**
 
@@ -221,25 +218,67 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - Harbor instances with custom roles: Rollback preserves data but makes custom roles inaccessible
 - Upgrade path: Standard Harbor upgrade (no special steps)
 
+## Performance Caching
+
+Moving permission resolution to the database adds a per-request cost. Rather than assume a
+caching design, it was **measured** with `goharbor/perf` (k6 / xk6-harbor, 500 VUs,
+5000 iters/endpoint, session-cookie auth, warm-up per endpoint) against the exact upstream
+commit the fork is based on, so the delta isolates the feature. Sysadmins are excluded — they
+skip the project-role evaluator entirely.
+
+**Measured problem** — per-request DB evaluation vs upstream, and the effect of the cache:
+
+| Endpoint | upstream | cache off | L1 (default) | L1 + L2 |
+|---|--:|--:|--:|--:|
+| get-project | 213 | 246 (+15.9 %) | 216 (+1.6 %) | 210 (−1.2 %) |
+| list-project-members | 174 | 203 (+17.1 %) | 172 (−0.7 %) | 169 (−2.8 %) |
+| list-repositories | 288 | 350 (+21.3 %) | 285 (−0.9 %) | 292 (+1.1 %) |
+| get-repository | 149 | 184 (+23.2 %) | 147 (−1.5 %) | 146 (−2.3 %) |
+| list-artifacts | 611 | 649 (+6.3 %) | 599 (−1.9 %) | 599 (−2.0 %) |
+| list-artifact-tags | 193 | 246 (+27.2 %) | 194 (+0.5 %) | 195 (+0.8 %) |
+| **overall mean** | **271** | **313 (+15.4 %)** | **269 (−0.8 %)** | **268 (−1.1 %)** |
+
+Uncached DB evaluation costs +15.4 % overall (up to +56 % on individual runs); the in-process
+cache restores upstream parity. L1-only and L1+L2 are statistically indistinguishable — Redis
+adds nothing on the per-request path.
+
+**Design — two tiers, both configurable, Redis off by default:**
+
+| `ROLE_CACHE_L1_MEMORY_TTL` / `ROLE_CACHE_L2_REDIS_TTL` | Behavior | Stale window | Redis on authz path |
+|---|---|---|---|
+| `1s` / `-1` (**default**) | in-process only | ≤ 1 s cross-node | none |
+| `-1` / `-1` | per-request DB | none (always fresh) | none |
+| `1s` / `30m` | two-tier | ≤ 1 s cross-node | opt-in only |
+| `-1` / `30m` | Redis only | none¹ | every request |
+
+¹ invalidated on change; 30-min TTL self-heals out-of-band DB edits.
+
+- **L1 (in-process, default 1 s):** the dominant freshness control; keeps authorization
+  in-process, so the default config puts **no Redis round-trip on the authz hot path** —
+  avoiding the failure mode of goharbor/harbor#23335 and the config-cache history
+  (#19156/63/64).
+- **L2 (Redis, opt-in, off by default):** for operators who want cross-node sharing; when
+  enabled it uses the shared `lib/cache.FetchOrSave` helper and **degrades to the DB** if
+  Redis is unavailable, so a Redis hiccup never fails an authz check.
+- **Invalidation:** a role create/update/delete drops the entry on the writing node
+  immediately (and the shared L2 key cluster-wide); other nodes converge within the L1 TTL.
+
 ## Implementation
 
-**Current Status: ~60% Complete**
+**Current Status: ~75% Complete** — core implementation (Phases 1–4) done; remaining work is test completion (integration/E2E), documentation, and review/polish.
 
 ### Phase 1: Foundation (✅ Complete)
 - Database schema design and migrations
 - Core RBAC permission loading logic
 - `role_permission` table integration
 
-**Owner:** Max Graustenzel  
-**Timeline:** Completed
 
 ### Phase 2: API Layer (✅ Complete)
 - `/api/v2.0/roles` endpoints (CRUD operations)
 - `/api/v2.0/permissions` endpoint extension
 - OpenAPI/Swagger specification
 
-**Owner:** Max Graustenzel  
-**Timeline:** Completed
+
 
 ### Phase 3: UI Components (✅ Complete)
 - System Administration → Roles management interface
@@ -247,26 +286,24 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - Permission selection interface
 - Built-in vs custom role indicators
 
-**Owner:** Max Graustenzel  
-**Timeline:** Completed
 
-### Phase 4: Security Validation (🔄 In Progress - 30%)
-- Privilege escalation prevention (robot creation)
-- Privilege escalation prevention (member assignment)
+
+### Phase 4: Security Validation (✅ Complete)
+- Privilege escalation prevention — **robot creation**: a user may create a robot only with permissions ≤ their own (`validateNoEscalation` / `isValidPermissionScope`), with a robot↔role permission mapping where needed
+- Privilege escalation prevention — **member assignment**: a project admin may assign a custom role only if they hold every permission it grants (`checkNoEscalation`), enforced on both member **create** and **update** paths
+- Custom-role **definition** restricted to system admins (`checkSysAdmin`); requested permissions constrained to the role permission catalog (`rbac.ScopeRole`)
+- Registry (v2) token behavior unchanged: permissions are frozen into the signed JWT at issue time and take effect on the next token negotiation (bounded by `token_expiration`, default 30 min) — standard Docker Registry v2 behavior, identical for project removal, built-in downgrades, and custom roles
 - Audit logging for all role operations
 - UI security enhancements (disable invalid permissions/roles in forms)
 
-**Owner:** Max Graustenzel  
-**Timeline:** 2 weeks
 
-### Phase 5: Testing (🔄 In Progress - 10%)
-- Unit tests (role CRUD, permission validation, cache behavior)
-- Integration tests (API contracts, multi-user scenarios, migrations)
-- Security tests (privilege escalation attempts, unauthorized access)
-- E2E tests (complete workflows via UI)
+### Phase 5: Testing (🔄 In Progress)
+- Unit tests: role CRUD, permission validation, two-tier cache behavior (L1 hit/expiry, L2 hit, invalidate, disabled tiers) — done
+- Security tests: escalation attempts covered at both unit and handler level (robot creation, member assign **and** modify paths, sysadmin-gated role definition) — done
+- Integration tests (API contracts, multi-user scenarios, migrations) — in progress
+- E2E tests (complete workflows via UI) — in progress
 
-**Owner:** Max Graustenzel  
-**Timeline:** 2 weeks
+
 
 ### Phase 6: Documentation (🔄 In Progress - 30%)
 - User guide (creating and managing custom roles)
@@ -274,8 +311,6 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - API documentation (code examples, migration guide)
 - Design documentation (architecture, trade-offs)
 
-**Owner:** Max Graustenzel  
-**Timeline:** 1 week
 
 ### Phase 7: Review & Polish (⏳ Not Started)
 - Performance optimization
@@ -283,10 +318,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - Code review addressing feedback
 - Release preparation
 
-**Owner:** Max Graustenzel + Community Reviewers  
-**Timeline:** 2-3 weeks
 
-**Estimated Timeline to Production Ready:** 6-10 weeks from current state
 
 **Repository:**
 - Fork: https://github.com/maxgraustenzel-create/harbor
@@ -294,48 +326,15 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 ## Open Issues
 
-### 1. Permission Granularity
-**Question:** Is project-level permission granularity sufficient, or should we support repository-level permissions?
 
-**Current Decision:** Project-level only (permissions apply to entire project, not individual repositories)  
-**Rationale:** 
-- Permissions are defined system-wide in `permission_policy` table
-- Applied per-project via `project_member` role assignments
-- Repository-level permissions would require different scope model and significant additional complexity
-- Project-level covers 70%+ of use cases
-- Repository-level permissions tracked separately in Issue #10159
+### 1. Permission Change Propagation
 
-**Open for Discussion:** Should repository-level permission assignment be part of this proposal or remain a separate future enhancement?
-
-### 2. Global vs. Project-Scoped Custom Roles
-**Question:** Should custom roles be system-wide (reusable across projects) or per-project?
-
-**Current Decision:** System-wide roles, assigned per-project (matches built-in role model)  
-**Rationale:** Consistent with existing Harbor model, easier to manage  
-**Open for Discussion:** Per-project custom roles could be added later if needed
-
-### 3. Role Templates
-**Question:** Should we provide predefined custom role templates (e.g., "Read-Only Auditor", "CI/CD Bot Manager")?
-
-**Current Decision:** No templates in initial release  
-**Rationale:** Keep initial scope focused, templates can be added based on community usage patterns  
-**Open for Discussion:** Community can contribute templates as documentation/examples
-
-### 4. Built-in Role Modification Policy
-**Question:** Should built-in roles be modifiable or immutable?
-
-**Current Decision:** Modifiable (with tracking and reset capability)  
-**Rationale:** Maximum flexibility, modifications are tracked, can be reset to defaults  
-**Alternative:** Immutable built-in roles (forces use of custom roles for any changes)  
-**Open for Discussion:** Security-conscious organizations may prefer immutable built-in roles
-
-### 5. Permission Change Propagation
-**Question:** Should permission changes apply immediately or at next login?
-
-**Current Decision:** Next login (session-scoped cache invalidation)  
-**Rationale:** Simpler implementation, minimal real-world impact (permissions rarely change mid-session)  
-**Alternative:** Real-time propagation (complex cache invalidation, performance overhead)  
-**Open for Discussion:** Real-time propagation could be added later if needed
+**Resolved:** Role changes converge across all nodes within the L1 cache TTL (**1 s** by
+default). The writing node updates its cache immediately; other nodes refresh on their next
+evaluation once their entry expires. Operators who need zero staleness can disable the cache
+(`ROLE_CACHE_L1_MEMORY_TTL=-1`) for per-request DB evaluation; those who prefer even lower DB
+load can raise the TTL, trading freshness for fewer queries. Session-scoped ("next login")
+caching was **withdrawn** as its revocation window was unacceptable.
 
 ---
 
