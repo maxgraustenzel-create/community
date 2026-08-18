@@ -44,7 +44,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - **Discriminator pattern:** `role_permission.role_type` distinguishes 'project-role' (users/groups) from 'robotaccount' (direct permissions)
 - **System admin only:** Only system administrators can create/modify custom roles (project admins assign roles, existing workflow unchanged)
 - **Built-in role protection:** Built-in roles can be modified but not deleted; modifications are tracked and reversible
-- **Caching out of scope of the proposal:** Instance scoped caching may provide a mean to mitigate the performance impact resulting from an additional DB query. However the caching implementation needs to be carefully alligned with the overall Harbor architecture and codebase and therefore require further discussion that shall not be part of this proposal. 
+- **Caching is out of scope for this proposal:** Instance-scoped caching may offer a means to mitigate the performance impact of the additional per-request database query. However, a caching implementation must be carefully aligned with Harbor's overall architecture and codebase, and therefore requires further discussion that is intentionally deferred and not part of this proposal.
+
 
 
 **Technical Architecture:**
@@ -119,8 +120,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 2. **Global role assignments:** Custom roles are assigned per-project (user can have different roles in different projects). Global role assignment is tracked in Issue #8351
 3. **Role templates/marketplace:** No predefined custom role templates in initial release
 4. **Role inheritance/composition:** Roles are flat, not hierarchical
-5. **Real-time permission updates:** Permission changes apply at next login (not mid-session)
-6. **Robot account roles:** Robots continue using direct permission assignment (no role concept)
+5. **Robot account roles:** Robots continue using direct permission assignment (no role concept)
 
 ## Rationale
 
@@ -200,8 +200,9 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 **Performance Impact:**
 
-- **Requests:** return time increases approximately 25%
-- **Database:** Load increase (one query + evaluation per request)
+ **Requests:** The naive per-request permission query adds latency to authorization checks — early, un-optimized measurements suggest roughly a 25% increase in request return time.
+- **Database:** One additional query plus permission evaluation per request.
+- **Mitigation:** Instance-scoped caching is a natural optimization but is deferred (see Key Design Decisions); the figures above represent the un-cached baseline.
 
 **Version Compatibility:**
 
@@ -318,12 +319,11 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 **Open for Discussion:** Security-conscious organizations may prefer immutable built-in roles
 
 ### 5. Permission Change Propagation
-**Question:** Should permission changes apply immediately or at next login?
+**Question:** How quickly should permission changes take effect?
 
-**Current Decision:** Inmediate, DB query for each request 
-**Rationale:** Simpler implementation, no cache window
-**Alternative:** Cahing (instance based or session based, memory caching, redis caching)
-**Open for Discussion:** Caching could be added later if needed
+**Current Decision:** Immediate — permissions are evaluated per request via a database query, so a changed role takes effect on the user's next request.
+**Trade-off:** This adds one query plus evaluation per request (see Performance Impact). Caching (instance-scoped or session-based) could reduce this cost but introduces a propagation-delay window; caching design is out of scope for this proposal (see Key Design Decisions).
+**Open for Discussion:** Whether the per-request query cost is acceptable for the initial release.
 
 ---
 
