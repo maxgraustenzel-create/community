@@ -36,7 +36,6 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 2. **API:** Add role CRUD endpoints for system administrators
 3. **UI:** Add role management interface in System Administration section
 4. **Security:** Implement privilege escalation prevention and audit logging
-5. **Caching:** Load permissions at login (session-scoped cache)
 
 **Key Design Decisions:**
 
@@ -45,6 +44,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - **Discriminator pattern:** `role_permission.role_type` distinguishes 'project-role' (users/groups) from 'robotaccount' (direct permissions)
 - **System admin only:** Only system administrators can create/modify custom roles (project admins assign roles, existing workflow unchanged)
 - **Built-in role protection:** Built-in roles can be modified but not deleted; modifications are tracked and reversible
+- **Caching out of scope of the proposal:** Instance scoped caching may provide a mean to mitigate the performance impact resulting from an additional DB query. However the caching implementation needs to be carefully alligned with the overall Harbor architecture and codebase and therefore require further discussion that shall not be part of this proposal. 
+
 
 **Technical Architecture:**
 
@@ -107,8 +108,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 1. **System Admin:** Creates custom role "DevOps Engineer" with specific permissions
 2. **Project Admin:** Assigns "DevOps Engineer" role to user/group (same as built-in roles)
-3. **User Login:** Permissions loaded into session cache
-4. **Authorization:** Permission checks use cached permissions (O(1) lookup)
+3. **User Login:** Permissions loaded from database
+4. **Authorization:** Permission checks load permissions from database
 
 ## Non-Goals
 
@@ -166,18 +167,6 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - More complex audit trail
 - Can be added later if needed
 
-**Why session-scoped caching:**
-
-✅ **Advantages:**
-- Fast permission checks (O(1) in-memory lookup)
-- No database queries during requests
-- Simple cache invalidation (logout = clear)
-- Minimal performance impact
-
-❌ **Alternative: Real-time permission updates:**
-- Requires complex cache invalidation across sessions
-- Performance overhead for permission change propagation
-- Added complexity for minimal benefit (permissions rarely change mid-session)
 
 ## Compatibility
 
@@ -211,9 +200,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 
 **Performance Impact:**
 
-- **Login:** +50-100ms (one-time permission load)
-- **Requests:** No change (cached permissions)
-- **Database:** Minimal load increase (one query per login)
+- **Requests:** return time increases approximately 25%
+- **Database:** Load increase (one query + evaluation per request)
 
 **Version Compatibility:**
 
@@ -250,7 +238,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 **Owner:** Max Graustenzel  
 **Timeline:** Completed
 
-### Phase 4: Security Validation (🔄 In Progress - 30%)
+### Phase 4: Security Validation (✅ Complete)
 - Privilege escalation prevention (robot creation)
 - Privilege escalation prevention (member assignment)
 - Audit logging for all role operations
@@ -259,8 +247,8 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 **Owner:** Max Graustenzel  
 **Timeline:** 2 weeks
 
-### Phase 5: Testing (🔄 In Progress - 10%)
-- Unit tests (role CRUD, permission validation, cache behavior)
+### Phase 5: Testing (✅ Complete)
+- Unit tests (role CRUD, permission validation)
 - Integration tests (API contracts, multi-user scenarios, migrations)
 - Security tests (privilege escalation attempts, unauthorized access)
 - E2E tests (complete workflows via UI)
@@ -332,10 +320,10 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 ### 5. Permission Change Propagation
 **Question:** Should permission changes apply immediately or at next login?
 
-**Current Decision:** Next login (session-scoped cache invalidation)  
-**Rationale:** Simpler implementation, minimal real-world impact (permissions rarely change mid-session)  
-**Alternative:** Real-time propagation (complex cache invalidation, performance overhead)  
-**Open for Discussion:** Real-time propagation could be added later if needed
+**Current Decision:** Inmediate, DB query for each request 
+**Rationale:** Simpler implementation, no cache window
+**Alternative:** Cahing (instance based or session based, memory caching, redis caching)
+**Open for Discussion:** Caching could be added later if needed
 
 ---
 
