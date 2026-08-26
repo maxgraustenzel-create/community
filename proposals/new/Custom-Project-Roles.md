@@ -184,6 +184,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - Built-in role permissions migrated from `rbac_role.go` to `role_permission` table
 - Existing roles automatically marked `is_builtin=true`
 - All user/group assignments preserved
+- If required for future versions, modifications of built-in roles and definition of new built-in role is done through database migration sql files
 - Rollback: Standard Harbor rollback procedure (custom roles become inaccessible but data preserved)
 
 **API Compatibility:**
