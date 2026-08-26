@@ -43,7 +43,7 @@ Extend Harbor's existing RBAC infrastructure to support custom roles by linking 
 - **Minimal schema changes:** Only extend `role` table with metadata columns (`is_builtin`, `description`, `modified`, `created_by`, `modified_by`, timestamps)
 - **Discriminator pattern:** `role_permission.role_type` distinguishes 'project-role' (users/groups) from 'robotaccount' (direct permissions)
 - **System admin only:** Only system administrators can create/modify custom roles (project admins assign roles, existing workflow unchanged)
-- **Built-in role protection:** Built-in roles can be modified but not deleted; modifications are tracked and reversible
+- **Built-in role protection:** Built-in roles are inmutable. They can not be modified nor deleted
 - **Caching is out of scope for this proposal:** Instance-scoped caching may offer a means to mitigate the performance impact of the additional per-request database query. However, a caching implementation must be carefully aligned with Harbor's overall architecture and codebase, and therefore requires further discussion that is intentionally deferred and not part of this proposal.
 
 
